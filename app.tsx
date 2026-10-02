@@ -7,80 +7,108 @@ import {
   type PluginRpcClient,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import {
+  DEFAULT_PLAN_PROMPT,
+  markerForState,
+  planModeRequestTarget,
+  withPlanModeMarker,
+  type ThreadPlanState,
+} from "./lib/plan-mode-input";
 
 const OVERLAY_ID = "plan-mode-border-overlay";
+const PROMPTBOX_SELECTOR = "form[data-promptbox], [data-promptbox], [data-promptbox-shell]";
 const DEFAULT_IMPLEMENT_PROMPT = "approved";
 
-// Thread-specific state and global fallback
-const threadPlanModeState = new Map<string, boolean>();
-let currentGlobalPlanMode = false;
-let currentActiveThreadId: string | null = null;
-let globalRpcClient: PluginRpcClient<typeof rpcContract> | null = null;
+type RpcClient = PluginRpcClient<typeof rpcContract>;
+
+// Shared by every composer in this window and by the fetch hook, which reads
+// it at send time. A null thread id is the new-chat composer.
+const threadStates = new Map<string, ThreadPlanState>();
+let newThreadEnabled = false;
+let newThreadDefault = false;
+let planPrompt = DEFAULT_PLAN_PROMPT;
+let rpcClient: RpcClient | null = null;
+// Keys the user toggled in this window; server reads no longer overwrite them.
+const locallyChanged = new Set<string | null>();
 const listeners = new Set<() => void>();
 
-function notifyListeners() {
+function getPlanState(threadId: string | null): ThreadPlanState {
+  if (threadId === null) return { enabled: newThreadEnabled, planned: false };
+  return threadStates.get(threadId) ?? { enabled: false, planned: false };
+}
+
+function storePlanState(threadId: string | null, enabled: boolean, planned = false) {
+  if (threadId === null) {
+    newThreadEnabled = enabled;
+  } else {
+    const previous = threadStates.get(threadId);
+    threadStates.set(threadId, { enabled, planned: enabled || planned || previous?.planned === true });
+  }
   listeners.forEach((fn) => fn());
 }
 
-export function getThreadPlanMode(threadId: string | null): boolean {
-  if (!threadId) return currentGlobalPlanMode;
-  return threadPlanModeState.get(threadId) ?? false;
+/** A user change: persisted, and authoritative over later server reads in this window. */
+function setPlanMode(threadId: string | null, enabled: boolean) {
+  locallyChanged.add(threadId);
+  storePlanState(threadId, enabled);
+  if (threadId !== null) persistPlanMode(threadId, enabled);
 }
 
-export function setThreadPlanMode(threadId: string | null, enabled: boolean) {
-  if (!threadId) {
-    currentGlobalPlanMode = enabled;
-  } else {
-    threadPlanModeState.set(threadId, enabled);
+function persistPlanMode(threadId: string, enabled: boolean): Promise<void> {
+  if (!rpcClient) {
+    console.warn("[plan-mode] RPC client not ready; Plan Mode change not persisted", threadId);
+    return Promise.resolve();
   }
-
-  notifyListeners();
-  applyDashedBorderToAllPromptboxes(enabled);
+  return rpcClient
+    .call("setPlanMode", { threadId, enabled })
+    .then(() => undefined)
+    .catch((error: unknown) => {
+      console.warn("[plan-mode] failed to persist Plan Mode", threadId, error);
+    });
 }
 
-export function toggleCurrentPlanMode(): boolean {
-  const current = getThreadPlanMode(currentActiveThreadId);
-  const next = !current;
-  setThreadPlanMode(currentActiveThreadId, next);
-  if (globalRpcClient) {
-    globalRpcClient
-      .call("setPlanMode", { threadId: currentActiveThreadId, enabled: next })
-      .catch(() => {});
-  }
-  return next;
+function syncPlanState(threadId: string | null, rpc: RpcClient, isCancelled: () => boolean) {
+  rpc
+    .call("getPlanMode", { threadId })
+    .then((res) => {
+      planPrompt = res.prompt;
+      newThreadDefault = res.defaultOn;
+      // Composers remount often (model switch, navigation); a read must never
+      // undo a toggle the user made here, even one still being persisted.
+      if (isCancelled() || locallyChanged.has(threadId)) return;
+      storePlanState(threadId, res.enabled, res.planned);
+    })
+    .catch((error: unknown) => {
+      console.warn("[plan-mode] failed to load Plan Mode", threadId, error);
+    });
 }
 
-export function hasPromptboxText(promptbox?: HTMLElement | null): boolean {
-  if (typeof document === "undefined") return false;
-  const box =
-    promptbox ||
-    document.querySelector<HTMLElement>(
-      'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
-    );
-  if (!box) return false;
+function usePlanMode(threadId: string | null): boolean {
+  const [active, setActive] = useState(() => getPlanState(threadId).enabled);
 
-  const editor = box.querySelector<HTMLElement>(
-    '.ProseMirror, [contenteditable="true"], textarea'
-  );
+  useEffect(() => {
+    const handler = () => setActive(getPlanState(threadId).enabled);
+    handler();
+    listeners.add(handler);
+    return () => {
+      listeners.delete(handler);
+    };
+  }, [threadId]);
+
+  return active;
+}
+
+function hasPromptboxText(promptbox: HTMLElement): boolean {
+  const editor = promptbox.querySelector<HTMLElement>('.ProseMirror, [contenteditable="true"], textarea');
   if (!editor) return false;
-
-  if (editor instanceof HTMLTextAreaElement) {
-    return editor.value.trim().length > 0;
-  }
+  if (editor instanceof HTMLTextAreaElement) return editor.value.trim().length > 0;
   return (editor.innerText || "").trim().length > 0;
 }
 
-export function submitPromptbox(promptbox?: HTMLElement | null) {
-  if (typeof document === "undefined") return;
-  const box =
-    promptbox ||
-    document.querySelector<HTMLElement>(
-      'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
-    );
-  if (!box) return;
-
+function submitPromptbox(promptbox: HTMLElement) {
   setTimeout(() => {
-    const form = (box instanceof HTMLFormElement ? box : box.closest("form")) as HTMLFormElement | null;
+    const form = (promptbox instanceof HTMLFormElement ? promptbox : promptbox.closest("form")) ??
+      promptbox.querySelector("form");
     const submitBtn = form?.querySelector<HTMLButtonElement>(
       'button[type="submit"], button[aria-label*="Submit"], button[title*="Submit"]'
     );
@@ -92,8 +120,8 @@ export function submitPromptbox(promptbox?: HTMLElement | null) {
   }, 20);
 }
 
-export function sendPlanExitDirectly(threadId: string | null) {
-  if (typeof window === "undefined" || !threadId || threadId === "new-thread") return;
+function sendPlanExitDirectly(threadId: string) {
+  // Goes through the fetch hook, which attaches the Plan Mode OFF block.
   fetch(`/api/v1/threads/${encodeURIComponent(threadId)}/send`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -101,17 +129,17 @@ export function sendPlanExitDirectly(threadId: string | null) {
       input: [{ type: "text", text: DEFAULT_IMPLEMENT_PROMPT, mentions: [] }],
       mode: "auto",
     }),
-  }).catch(() => {});
+  }).catch((error: unknown) => {
+    console.warn("[plan-mode] failed to send implement message", threadId, error);
+  });
 }
 
 function getSolidBorderColor(box: HTMLElement): string {
-  // If previously saved:
   const saved = box.getAttribute("data-original-border-color");
   if (saved && saved !== "transparent" && saved !== "rgba(0, 0, 0, 0)") {
     return saved;
   }
 
-  // Read current computed border color before setting it transparent
   const computed = window.getComputedStyle(box).borderColor;
   if (computed && computed !== "transparent" && computed !== "rgba(0, 0, 0, 0)") {
     box.setAttribute("data-original-border-color", computed);
@@ -163,146 +191,79 @@ function updatePromptboxDashedOverlay(box: HTMLElement, enabled: boolean) {
     }
   } else {
     box.style.removeProperty("border-color");
-    if (overlay) {
-      overlay.remove();
-    }
+    overlay?.remove();
   }
 }
 
-function applyDashedBorderToAllPromptboxes(enabled: boolean) {
-  if (typeof document === "undefined") return;
-  const promptboxes = document.querySelectorAll<HTMLElement>(
-    'form[data-promptbox], [data-promptbox], [data-promptbox-shell] form'
-  );
-  promptboxes.forEach((box) => {
-    updatePromptboxDashedOverlay(box, enabled);
-  });
-
-  if (enabled) {
-    document.body.classList.add("bb-plan-mode-active");
-    document.documentElement.classList.add("bb-plan-mode-active");
-  } else {
-    document.body.classList.remove("bb-plan-mode-active");
-    document.documentElement.classList.remove("bb-plan-mode-active");
-  }
+// Keyboard shortcuts act only on the composer the key was pressed in.
+interface ComposerShortcuts {
+  toggle(): void;
+  isActive(): boolean;
+  exitAndSend(): void;
 }
+const composerShortcuts = new Map<Element, ComposerShortcuts>();
 
-function usePlanMode(threadId: string | null): [boolean, (next: boolean) => void] {
-  const [active, setActive] = useState(() => getThreadPlanMode(threadId));
-
-  useEffect(() => {
-    setActive(getThreadPlanMode(threadId));
-    const handler = () => {
-      setActive(getThreadPlanMode(threadId));
-    };
-    listeners.add(handler);
-    return () => {
-      listeners.delete(handler);
-    };
-  }, [threadId]);
-
-  const updateMode = useCallback(
-    (next: boolean) => {
-      setThreadPlanMode(threadId, next);
-    },
-    [threadId]
-  );
-
-  return [active, updateMode];
+function shortcutsFor(target: EventTarget | null): ComposerShortcuts | null {
+  let box = target instanceof Element ? target.closest(PROMPTBOX_SELECTOR) : null;
+  while (box) {
+    const shortcuts = composerShortcuts.get(box);
+    if (shortcuts) return shortcuts;
+    box = box.parentElement?.closest(PROMPTBOX_SELECTOR) ?? null;
+  }
+  return null;
 }
 
 function PlanModeToggle() {
-  const { threadId } = useBbContext();
-  const [active, setActiveState] = usePlanMode(threadId);
+  const { threadId: rawThreadId } = useBbContext();
+  // The new-chat composer has no thread yet.
+  const threadId = !rawThreadId || rawThreadId === "new-thread" ? null : rawThreadId;
+  const active = usePlanMode(threadId);
   const rpc = useRpc<typeof rpcContract>();
   const buttonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    currentActiveThreadId = threadId;
-    globalRpcClient = rpc;
-  }, [threadId, rpc]);
-
-  // Sync state from backend RPC
-  useEffect(() => {
+    rpcClient = rpc;
     let cancelled = false;
-    rpc
-      .call("getPlanMode", { threadId })
-      .then((res) => {
-        if (!cancelled && res) {
-          if (typeof res.enabled === "boolean") {
-            setActiveState(res.enabled);
-          }
-        }
-      })
-      .catch(() => {});
+    syncPlanState(threadId, rpc, () => cancelled);
     return () => {
       cancelled = true;
     };
-  }, [threadId, rpc, setActiveState]);
+  }, [threadId, rpc]);
 
-  // Apply dashed border overlay to the promptbox
   useEffect(() => {
-    const promptbox = buttonRef.current?.closest(
-      'form[data-promptbox], [data-promptbox], [data-promptbox-shell]'
-    ) as HTMLElement | null;
-
-    if (promptbox) {
-      updatePromptboxDashedOverlay(promptbox, active);
-    }
-
-    applyDashedBorderToAllPromptboxes(active);
-    return () => {
-      if (promptbox) {
-        updatePromptboxDashedOverlay(promptbox, false);
-      }
-    };
+    const promptbox = buttonRef.current?.closest<HTMLElement>(PROMPTBOX_SELECTOR);
+    if (!promptbox) return;
+    updatePromptboxDashedOverlay(promptbox, active);
+    return () => updatePromptboxDashedOverlay(promptbox, false);
   }, [active]);
 
   const toggle = useCallback(() => {
-    const next = !active;
-    setActiveState(next);
-    rpc.call("setPlanMode", { threadId, enabled: next }).catch(() => {});
-  }, [active, setActiveState, rpc, threadId]);
+    setPlanMode(threadId, !getPlanState(threadId).enabled);
+  }, [threadId]);
 
-  // Attach Shift+Tab and Cmd+Enter / Ctrl+Enter directly on the promptbox form
   useEffect(() => {
-    const promptbox = buttonRef.current?.closest(
-      'form[data-promptbox], [data-promptbox]'
-    ) as HTMLElement | null;
+    const promptbox = buttonRef.current?.closest<HTMLElement>(PROMPTBOX_SELECTOR);
     if (!promptbox) return;
-
-    function handleFormKeyDown(e: KeyboardEvent) {
-      // Shift + Tab: toggle between Implement and Plan
-      if (e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        toggle();
-        return;
-      }
-
-      // Cmd + Enter or Ctrl + Enter: when in plan mode, leaves plan mode and submits (or sends "approved" if empty)
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
-        if (active) {
-          e.preventDefault();
-          e.stopPropagation();
-
-          setActiveState(false);
-          rpc.call("setPlanMode", { threadId, enabled: false }).catch(() => {});
-
-          if (hasPromptboxText(promptbox)) {
-            submitPromptbox(promptbox);
-          } else {
-            sendPlanExitDirectly(threadId);
-          }
+    composerShortcuts.set(promptbox, {
+      toggle,
+      isActive: () => getPlanState(threadId).enabled,
+      exitAndSend() {
+        setPlanMode(threadId, false);
+        if (hasPromptboxText(promptbox)) {
+          submitPromptbox(promptbox);
+        } else if (threadId !== null) {
+          sendPlanExitDirectly(threadId);
         }
-      }
-    }
-
-    promptbox.addEventListener("keydown", handleFormKeyDown, { capture: true });
+      },
+    });
     return () => {
-      promptbox.removeEventListener("keydown", handleFormKeyDown, { capture: true });
+      composerShortcuts.delete(promptbox);
     };
-  }, [active, toggle, setActiveState, rpc, threadId]);
+  }, [threadId, toggle]);
+
+  const label = active
+    ? "Plan Mode ON: the agent will only plan. Click or Shift+Tab to turn off; Ctrl/Cmd+Enter turns off and sends."
+    : "Plan Mode off. Click or Shift+Tab to turn on.";
 
   return (
     <button
@@ -313,50 +274,96 @@ function PlanModeToggle() {
         e.stopPropagation();
         toggle();
       }}
-      aria-label={
+      aria-pressed={active}
+      aria-label={label}
+      title={label}
+      className={
         active
-          ? "Plan mode active (Shift+Tab to switch to Implement)"
-          : "Implement mode active (Shift+Tab to switch to Plan)"
+          ? "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-primary/15 px-2 text-xs font-medium text-primary transition-colors hover:bg-primary/25 select-none"
+          : "inline-flex size-8 shrink-0 items-center justify-center rounded-lg p-0 text-muted-foreground/60 transition-colors hover:bg-muted/60 hover:text-foreground select-none"
       }
-      title={
-        active
-          ? "Plan mode active (Shift+Tab or Ctrl+Enter to exit and implement)"
-          : "Implement mode (Shift+Tab to switch to Plan)"
-      }
-      className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg p-0 text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground select-none"
     >
-      {active ? (
-        /* Plan Icon: Clipboard with checkmark */
-        <svg
-          className="size-4"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
-          <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
-          <path d="m9 14 2 2 4-4" />
-        </svg>
-      ) : (
-        /* Implement Icon: Code brackets </> */
-        <svg
-          className="size-4"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        >
-          <polyline points="16 18 22 12 16 6" />
-          <polyline points="8 6 2 12 8 18" />
-        </svg>
-      )}
+      <svg
+        className="size-4"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+        <rect x="8" y="2" width="8" height="4" rx="1" ry="1" />
+        {active && <path d="m9 14 2 2 4-4" />}
+      </svg>
+      {active && <span>Plan</span>}
     </button>
   );
+}
+
+// Attach the Plan Mode block to every bb API request that carries a user
+// message. Returns null for requests this hook leaves untouched.
+function planModeRequest(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+): { threadId: string | null; body: Record<string, unknown> } | null {
+  if (typeof init?.body !== "string") return null;
+  const url = typeof input === "string" ? input : input instanceof URL ? input.href : null;
+  if (url === null) return null;
+  const target = planModeRequestTarget(init.method ?? "GET", new URL(url, window.location.href).pathname);
+  if (!target) return null;
+
+  let body: unknown;
+  try {
+    body = JSON.parse(init.body);
+  } catch {
+    return null;
+  }
+  if (!body || typeof body !== "object") return null;
+  const record = body as Record<string, unknown>;
+  if (!Array.isArray(record.input) || record.input.length === 0) return null;
+  // Forks and child threads are not the new-chat composer's thread.
+  if (target.kind === "new-thread" && (record.sourceThreadId || record.parentThreadId)) return null;
+  return { threadId: target.kind === "thread" ? target.threadId : null, body: record };
+}
+
+async function adoptCreatedThread(response: Response, enabled: boolean) {
+  if (!response.ok) return;
+  // The next new chat starts from the default again.
+  locallyChanged.delete(null);
+  storePlanState(null, newThreadDefault);
+  if (!enabled) return;
+  const created = (await response.clone().json().catch(() => null)) as
+    | { id?: unknown; thread?: { id?: unknown } }
+    | null;
+  const id = created?.id ?? created?.thread?.id;
+  if (typeof id !== "string") {
+    console.warn("[plan-mode] could not read the created thread id; Plan Mode not carried over");
+    return;
+  }
+  setPlanMode(id, true);
+  await persistPlanMode(id, true);
+}
+
+function installFetchHook(): () => void {
+  const originalFetch = window.fetch;
+  const hooked: typeof window.fetch = async (input, init) => {
+    const request = planModeRequest(input, init);
+    if (!request) return originalFetch(input, init);
+
+    const state = getPlanState(request.threadId);
+    const nextInput = withPlanModeMarker(request.body.input as unknown[], markerForState(state), planPrompt);
+    const response = await originalFetch(input, {
+      ...init,
+      body: JSON.stringify({ ...request.body, input: nextInput }),
+    });
+    if (request.threadId === null) await adoptCreatedThread(response, state.enabled);
+    return response;
+  };
+  window.fetch = hooked;
+  return () => {
+    if (window.fetch === hooked) window.fetch = originalFetch;
+  };
 }
 
 export default definePluginApp((app: PluginAppBuilder) => {
@@ -373,50 +380,33 @@ export default definePluginApp((app: PluginAppBuilder) => {
 
   app.contentScripts.register({
     id: "plan-mode-keyboard-interceptor",
-    mount({ signal }) {
+    mount() {
       function handleWindowKeyDown(e: KeyboardEvent) {
-        // Shift + Tab: toggle between Implement and Plan
+        const shortcuts = shortcutsFor(e.target);
+        if (!shortcuts) return;
+
+        // Shift+Tab: toggle Plan Mode
         if (e.key === "Tab" && e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
           e.preventDefault();
           e.stopPropagation();
-          toggleCurrentPlanMode();
+          shortcuts.toggle();
           return;
         }
 
-        // Cmd + Enter or Ctrl + Enter: leaves plan mode and submits (or sends "approved" if empty)
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) {
-          const isPlanOn = getThreadPlanMode(currentActiveThreadId);
-          if (isPlanOn) {
-            e.preventDefault();
-            e.stopPropagation();
-            setThreadPlanMode(currentActiveThreadId, false);
-            if (globalRpcClient) {
-              globalRpcClient
-                .call("setPlanMode", { threadId: currentActiveThreadId, enabled: false })
-                .catch(() => {});
-            }
-            if (hasPromptboxText()) {
-              submitPromptbox();
-            } else {
-              sendPlanExitDirectly(currentActiveThreadId);
-            }
-          }
+        // Cmd/Ctrl+Enter in Plan Mode: turn it off and send (or send "approved" if empty)
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing && shortcuts.isActive()) {
+          e.preventDefault();
+          e.stopPropagation();
+          shortcuts.exitAndSend();
         }
       }
 
       window.addEventListener("keydown", handleWindowKeyDown, { capture: true });
-
-      const observer = new MutationObserver(() => {
-        if (document.body.classList.contains("bb-plan-mode-active")) {
-          applyDashedBorderToAllPromptboxes(true);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true });
+      const uninstallFetchHook = installFetchHook();
 
       return () => {
         window.removeEventListener("keydown", handleWindowKeyDown, { capture: true });
-        observer.disconnect();
-        applyDashedBorderToAllPromptboxes(false);
+        uninstallFetchHook();
       };
     },
   });
