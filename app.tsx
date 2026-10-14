@@ -269,6 +269,11 @@ function PlanModeToggle() {
     <button
       ref={buttonRef}
       type="button"
+      onPointerDown={(e) => {
+        // Keep the editor (and mobile keyboard) focused. Otherwise the
+        // compact composer can remove this action before its click arrives.
+        if (e.button === 0) e.preventDefault();
+      }}
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
