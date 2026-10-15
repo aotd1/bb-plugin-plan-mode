@@ -7,6 +7,7 @@ import {
   type PluginRpcClient,
 } from "@get-bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
+import { suppressTouchCompatibilityClick } from "./lib/touch-click";
 import {
   DEFAULT_PLAN_PROMPT,
   markerForState,
@@ -220,6 +221,8 @@ function PlanModeToggle() {
   const active = usePlanMode(threadId);
   const rpc = useRpc<typeof rpcContract>();
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const touchRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+  const suppressTouchClickRef = useRef(false);
 
   useEffect(() => {
     rpcClient = rpc;
@@ -270,13 +273,47 @@ function PlanModeToggle() {
       ref={buttonRef}
       type="button"
       onPointerDown={(e) => {
-        // Keep the editor (and mobile keyboard) focused. Otherwise the
-        // compact composer can remove this action before its click arrives.
+        if (!e.isPrimary || e.button !== 0) return;
+        suppressTouchClickRef.current = false;
+        touchRef.current = e.pointerType === "touch"
+          ? { pointerId: e.pointerId, x: e.clientX, y: e.clientY }
+          : null;
+        e.preventDefault();
+      }}
+      onPointerMove={(e) => {
+        const touch = touchRef.current;
+        if (touch && touch.pointerId === e.pointerId &&
+          Math.hypot(e.clientX - touch.x, e.clientY - touch.y) > 10) {
+          touchRef.current = null;
+          suppressTouchClickRef.current = true;
+        }
+      }}
+      onPointerCancel={(e) => {
+        if (touchRef.current?.pointerId !== e.pointerId) return;
+        touchRef.current = null;
+        suppressTouchClickRef.current = true;
+      }}
+      onPointerUp={(e) => {
+        const touch = touchRef.current;
+        if (!touch || touch.pointerId !== e.pointerId) return;
+        touchRef.current = null;
+        suppressTouchClickRef.current = true;
+        const bounds = e.currentTarget.getBoundingClientRect();
+        if (Math.hypot(e.clientX - touch.x, e.clientY - touch.y) > 10 ||
+          e.clientX < bounds.left || e.clientX >= bounds.right ||
+          e.clientY < bounds.top || e.clientY >= bounds.bottom) return;
+        suppressTouchCompatibilityClick(e.currentTarget.ownerDocument);
+        toggle();
+      }}
+      onMouseDown={(e) => {
+        // Match BB's mobile menu triggers: protect against the compatibility
+        // mousedown as well as pointerdown dismissing the editor keyboard.
         if (e.button === 0) e.preventDefault();
       }}
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (e.button !== 0 || (suppressTouchClickRef.current && e.detail > 0)) return;
         toggle();
       }}
       aria-pressed={active}
